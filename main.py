@@ -335,4 +335,12 @@ if __name__ == "__main__":
         print("API_HASH=your_api_hash")
         exit(1)
     
-    demo.launch()
+    # Get port from environment variable (Render sets this)
+    port = int(os.getenv("PORT", 7860))
+    
+    # Launch with server_name and port for Render deployment
+    demo.launch(
+        server_name="0.0.0.0",  # Bind to all interfaces
+        server_port=port,        # Use Render's PORT
+        share=False              # Don't create Gradio share link
+    )
