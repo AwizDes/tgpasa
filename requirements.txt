@@ -1,5 +1,5 @@
-gradio>=3.0
-pyrogram>=2.0
+pyrogram
 tgcrypto
-boto3
+gradio
 uvloop
+motor
