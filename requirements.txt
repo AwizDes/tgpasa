@@ -1,5 +1,4 @@
-pyrogram
-tgcrypto
+pyrogram[speed]
 gradio
 uvloop
-
+tgcrypto
