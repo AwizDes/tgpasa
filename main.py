@@ -80,11 +80,18 @@ async def send_replacement_until_good(client, chat_id):
         log(f" -> Replacement rolled {val}")
 
         if val in BAD_ROLLS:
+            occurrence_before = bad_roll_occurrences[val]
             bad_roll_occurrences[val] += 1
             messages_to_delete.append(new_msg)
             last_bad_rolls[val] = new_msg
             
-            log(f" X Bad replacement {val}, retrying...")
+            # If this is the first occurrence of this bad roll (even in replacement), accept it
+            if occurrence_before == 0:
+                good_dice_count += 1
+                log(f" OK First occurrence of bad roll {val} in replacement: counted as good -> total {good_dice_count}")
+                return new_msg
+            
+            log(f" X Bad replacement {val} (occurrence #{bad_roll_occurrences[val]}), retrying...")
             await asyncio.sleep(0.3)
             continue
 
