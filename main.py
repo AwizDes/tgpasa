@@ -1,27 +1,33 @@
-import asyncio
 import os
-import gradio as gr
+import asyncio
 import uvloop
+import gradio as gr
 from pyrogram import Client
+from pyrogram.errors import SessionPasswordNeeded
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# ========== CONFIG ==========
+SESSION_DIR = "./sessions"
+os.makedirs(SESSION_DIR, exist_ok=True)
+
 MONGO_URI = os.environ.get("MONGO_URI")
 DB_NAME = "tgpasa"
 COLLECTION_NAME = "settings"
-SESSION_DIR = "./sessions"
-# ============================
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 db_client = AsyncIOMotorClient(MONGO_URI)
 db = db_client[DB_NAME][COLLECTION_NAME]
 
-# Global variables
 client = None
 running = False
 log_buffer = []
 
+good_dice_count = 0
+bad_roll_occurrences = {}
+messages_to_delete = {}
+last_bad_rolls = {}
+
+# ---------------- UTILS ----------------
 def log(msg):
     print(msg)
     log_buffer.append(msg)
@@ -35,98 +41,87 @@ async def load_settings():
     doc = await db.find_one({})
     return doc or {}
 
-async def run_bot(api_id, api_hash, target_chat, bad_rolls, user_id):
-    global client, running
-    log("Starting Pyrogram client...")
+def reset_round():
+    global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
+    good_dice_count = 0
+    bad_roll_occurrences = {}
+    messages_to_delete = {}
+    last_bad_rolls = {}
 
+# ---------------- AUTHENTICATION ----------------
+async def start_bot_with_auth(api_id, api_hash, phone_number, target_chat, bad_rolls, target_good_dice=6):
+    global client, running
+
+    session_file = os.path.join(SESSION_DIR, f"{api_id}.session")
     client = Client(
-        name=str(api_id),
+        name=session_file,
         api_id=int(api_id),
         api_hash=api_hash,
-        workdir=SESSION_DIR,
-        in_memory=False
+        workdir=SESSION_DIR
     )
 
-    await client.start()
-    log("Bot started ✅")
+    await client.connect()
+    if not await client.is_connected():
+        log("❌ Could not connect")
+        return "\n".join(log_buffer)
 
-    target_chat = int(target_chat)
-    bad_rolls = [int(x.strip()) for x in bad_rolls.split(",") if x.strip().isdigit()]
+    # Check if first-time login
+    if not os.path.exists(session_file):
+        log(f"📱 First-time login detected. Sending code to {phone_number}...")
+        try:
+            await client.send_code_request(phone_number)
+            log("✅ Code sent. Enter code in 'Auth Code' input.")
+        except Exception as e:
+            log(f"❌ Error sending code: {e}")
+            return "\n".join(log_buffer)
 
     running = True
+    reset_round()
 
-    while running:
-        try:
-            msg = await client.send_dice(target_chat, "🎲")
-            value = msg.dice.value
-            log(f"Rolled: {value}")
+    # Wait for auth code input via UI
+    return "\n".join(log_buffer)
 
-            if value in bad_rolls:
-                log(f"Bad roll {value}, retrying...")
-                await asyncio.sleep(2)
-                continue
+async def complete_auth(auth_code):
+    global client
+    try:
+        await client.sign_in(code=auth_code)
+    except SessionPasswordNeeded:
+        # 2FA password
+        log("Enter your 2FA password in the same field.")
+        return "\n".join(log_buffer)
+    log("✅ Authentication successful!")
+    return "\n".join(log_buffer)
 
-            log(f"Good roll {value}, stopping!")
-            break
-
-        except Exception as e:
-            log(f"Error: {e}")
-            await asyncio.sleep(5)
-
-    await client.stop()
-    log("Bot stopped ⛔")
-
-async def stop_bot():
-    global running, client
-    running = False
-    if client:
-        await client.stop()
-    log("Stopped manually ⛔")
-
-async def start(api_id, api_hash, target_chat, bad_rolls, user_id):
+# ---------------- GRADIO UI ----------------
+async def start(api_id, api_hash, phone_number, target_chat, bad_rolls, target_good_dice=6):
     await save_settings({
         "api_id": api_id,
         "api_hash": api_hash,
+        "phone_number": phone_number,
         "target_chat": target_chat,
         "bad_rolls": bad_rolls,
-        "user_id": user_id,
+        "target_good_dice": target_good_dice
     })
-    asyncio.create_task(run_bot(api_id, api_hash, target_chat, bad_rolls, user_id))
+    asyncio.create_task(start_bot_with_auth(api_id, api_hash, phone_number, target_chat, bad_rolls, target_good_dice))
     return "\n".join(log_buffer)
 
-async def stop():
-    await stop_bot()
-    return "\n".join(log_buffer)
-
-async def load_defaults():
-    data = await load_settings()
-    return (
-        data.get("api_id", ""),
-        data.get("api_hash", ""),
-        data.get("target_chat", ""),
-        data.get("bad_rolls", "1,2"),
-        data.get("user_id", ""),
-    )
-
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("## 🎯 Dice Bot Controller")
+with gr.Blocks() as demo:
+    gr.Markdown("## 🎯 Dice Bot Controller with Online Auth")
     with gr.Row():
         api_id = gr.Textbox(label="API ID")
         api_hash = gr.Textbox(label="API HASH")
-    with gr.Row():
-        target_chat = gr.Textbox(label="Target Chat ID")
-        user_id = gr.Textbox(label="User ID (optional)")
+    phone_number = gr.Textbox(label="Phone Number (+65...)")
+    target_chat = gr.Textbox(label="Target Chat ID")
+    target_good_dice = gr.Number(label="Target Good Dice", value=6)
     bad_rolls = gr.Textbox(label="Bad Rolls (comma separated)", value="1,2")
+    auth_code = gr.Textbox(label="Auth Code (for first-time login)")
     console = gr.Textbox(label="Console Output", lines=20, interactive=False)
-    start_btn = gr.Button("🚀 Start")
-    stop_btn = gr.Button("🛑 Stop")
 
-    start_btn.click(start, inputs=[api_id, api_hash, target_chat, bad_rolls, user_id], outputs=console)
-    stop_btn.click(stop, outputs=console)
+    start_btn = gr.Button("🚀 Start & Send Code")
+    verify_btn = gr.Button("✅ Complete Auth")
 
-    demo.load(load_defaults, outputs=[api_id, api_hash, target_chat, bad_rolls, user_id])
+    start_btn.click(start, inputs=[api_id, api_hash, phone_number, target_chat, bad_rolls, target_good_dice], outputs=console)
+    verify_btn.click(complete_auth, inputs=[auth_code], outputs=console)
 
-demo.queue()
 port = int(os.environ.get("PORT", 7860))
 demo.launch(server_name="0.0.0.0", server_port=port)
-
