@@ -28,10 +28,16 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 
 # Load session string from file instead of env var (Windows has 32KB limit)
-SESSION_STRING = None
-if os.path.exists("session_string.txt"):
+SESSION_STRING = os.getenv("SESSION_STRING")  # Try env var first
+
+if not SESSION_STRING and os.path.exists("session_string.txt"):
     with open("session_string.txt", "r") as f:
         SESSION_STRING = f.read().strip()
+    print("[Session] Loaded session string from session_string.txt")
+elif SESSION_STRING:
+    print("[Session] Loaded session string from environment variable")
+else:
+    print("[Warning] No session string found! Bot will require interactive login.")
 
 # Global state
 app = None
@@ -155,10 +161,11 @@ async def start_monitoring():
     
     # Use string session if available, otherwise use file-based session
     if SESSION_STRING:
-        log("[Session] Using string session from config")
+        log(f"[Session] Using string session (length: {len(SESSION_STRING)} chars)")
+        log(f"[Session] Session string starts with: {SESSION_STRING[:10]}...")
         app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
     else:
-        log("[Session] Using file-based session")
+        log("[Session] No session string found - using file-based session (will require login)")
         app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH)
     
     @app.on_message(filters.chat(TARGET_CHAT_ID) & filters.dice)
