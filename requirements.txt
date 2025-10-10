@@ -2,3 +2,5 @@ pyrogram[speed]
 gradio
 uvloop
 tgcrypto
+python-dotenv
+
