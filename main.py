@@ -1,4 +1,5 @@
 import asyncio
+import os
 import gradio as gr
 import uvloop
 from pyrogram import Client
@@ -126,5 +127,6 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     demo.load(load_defaults, outputs=[api_id, api_hash, target_chat, bad_rolls, user_id])
 
 demo.queue()
-demo.launch(server_name="0.0.0.0", server_port=10000)
+port = int(os.environ.get("PORT", 7860))
+demo.launch(server_name="0.0.0.0", server_port=port)
 
