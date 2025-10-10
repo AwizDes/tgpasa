@@ -47,7 +47,6 @@ async def perform_batch_deletion():
         if not messages_to_delete:
             return "🧹 No bad messages queued."
 
-        # Determine which messages to keep (the last bad roll of each value)
         keep_ids = {msg.id for msg in last_bad_rolls.values() if msg}
         all_ids = {msg.id for msg in messages_to_delete if msg}
         delete_ids = list(all_ids - keep_ids)
@@ -55,8 +54,6 @@ async def perform_batch_deletion():
         if delete_ids:
             print(f"[CLEANUP] Deleting {len(delete_ids)} messages, keeping {len(keep_ids)} latest bad rolls...")
             
-            # Resolve peer is necessary for DeleteMessages to work on supergroups/channels
-            # We use app.resolve_peer directly on the client instance
             peer = await app.resolve_peer(TARGET_CHAT_ID)
             await app.invoke(DeleteMessages(channel=peer, id=delete_ids))
             return f"✅ Deleted {len(delete_ids)} messages successfully."
@@ -82,12 +79,10 @@ async def send_replacement_until_good(client, chat_id):
             messages_to_delete.append(new_msg)
             last_bad_rolls[val] = new_msg
             
-            # Always retry on a bad replacement roll
             print(f" ❌ Bad replacement {val}, retrying...")
             await asyncio.sleep(0.3)
             continue
 
-        # Good replacement
         good_dice_count += 1
         print(f" ✓ Replacement accepted good {val} → total {good_dice_count}")
         return new_msg
@@ -98,7 +93,6 @@ async def send_replacement_until_good(client, chat_id):
 async def handle_dice(client, message):
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
 
-    # Check if the message is from the configured chat AND the bot is active
     if message.chat.id != TARGET_CHAT_ID or not client_running.is_set():
         return
         
@@ -114,19 +108,15 @@ async def handle_dice(client, message):
         occurrence = bad_roll_occurrences[val]
 
         if occurrence == 1:
-            # First occurrence of original roll: count as good
             good_dice_count += 1
             print(f"⚠ First occurrence of bad roll {val}: counted as good.")
         else:
-            # Duplicate: send replacement
             print(f"❌ Duplicate bad roll {val} — sending replacements.")
             await send_replacement_until_good(client, message.chat.id)
     else:
-        # Good roll
         good_dice_count += 1
         print(f"✓ Good roll: {val} → total {good_dice_count}")
 
-    # Cleanup after reaching target
     if good_dice_count >= TARGET_GOOD_DICE:
         print(f"\n🎯 Target reached ({good_dice_count}/{TARGET_GOOD_DICE}). Cleaning up...")
         result = await perform_batch_deletion()
@@ -135,19 +125,31 @@ async def handle_dice(client, message):
         print("✅ Round complete! Ready for next one.\n")
 
 
-# --- BOT LIFECYCLE MANAGEMENT FOR GRADIO ---
+# --- BOT LIFECYCLE MANAGEMENT FOR GRADIO (Enhanced Debugging) ---
 
 async def start_client_task():
     """Initializes and runs the Pyrogram client non-blockingly using STRING_SESSION."""
     global app, TARGET_CHAT_ID
     
+    # IMMEDIATE CONFIG CHECK (Prints to console immediately)
+    print("\n" + "="*50)
+    print("[DEBUG] Environment Variable Check:")
+    print(f"API_ID is set: {API_ID != 0}")
+    print(f"API_HASH is set: {bool(API_HASH)}")
+    print(f"STRING_SESSION is set (non-empty): {bool(STRING_SESSION)}")
+    print(f"Target Chat ID (from UI): {TARGET_CHAT_ID}")
+    print("="*50)
+    
+    # 1. Critical configuration validation
     if API_ID == 0 or not API_HASH:
-        return f"ERROR: API_ID or API_HASH not set as environment variables."
+        print("CRITICAL ERROR: API_ID or API_HASH missing from environment.")
+        return "ERROR: API_ID or API_HASH missing from environment variables."
     if not STRING_SESSION:
-        return f"ERROR: STRING_SESSION is required and not set as an environment variable."
-        
-    print(f"\n[CLIENT] Initializing Pyrogram client using String Session...")
-    # Initialize client using the string session directly. The session file 'tgpasa.session' will not be created.
+        print("CRITICAL ERROR: STRING_SESSION missing from environment.")
+        return "ERROR: STRING_SESSION is required and not set as an environment variable."
+
+    print(f"\n[CLIENT] Initializing Pyrogram client...")
+    # Initialize client using the string session.
     app = Client(STRING_SESSION, api_id=API_ID, api_hash=API_HASH)
 
     try:
@@ -165,9 +167,13 @@ async def start_client_task():
     except asyncio.CancelledError:
         print("[CLIENT] Pyrogram client task cancelled.")
     except Exception as e:
-        print(f"❌ [CLIENT] Failed to start client: {e}")
+        # **This is the key improvement:** Catch the Pyrogram connection error here
+        # and print it before the function returns. This catches errors like
+        # session invalidation, FloodWait, or bad API keys.
+        error_message = f"❌ [CLIENT] Failed to start client or connection lost. Pyrogram Error: {e}"
+        print(error_message)
         client_running.clear()
-        return f"❌ Failed to start client. Error: {e}"
+        return error_message
     finally:
         if app and app.is_connected:
             await app.stop()
@@ -201,18 +207,28 @@ async def start_bot(chat_id_str, bad_rolls_str):
         reset_session()
         
         # 3. Start the Pyrogram client in a background task
-        asyncio.create_task(start_client_task())
+        # We assign the task a name for better debugging/tracking on stop
+        task = asyncio.create_task(start_client_task(), name='Pyrogram-Client-Task')
         
-        await asyncio.sleep(2) # Give it time to initialize
+        await asyncio.sleep(3) # Give more time to initialize and fail if config is bad
 
         if client_running.is_set():
              return f"✅ Bot started! Monitoring Chat ID: {TARGET_CHAT_ID}. Bad Rolls: {list(BAD_ROLLS)}."
         else:
-             # This means start_client_task returned an error
-             return "❌ Bot failed to start (check console logs for details on API key/session errors)."
+             # If it failed to start, we must retrieve the error message from the task result
+             if task.done():
+                 # task.result() will raise the exception if one occurred in the task,
+                 # or return the string result from the task.
+                 try:
+                     result = task.result()
+                     return result if isinstance(result, str) and ("ERROR" in result or "Failed" in result) else "❌ Bot failed to start (check Render logs for initial config check failure)."
+                 except Exception as e:
+                     return f"❌ Bot failed during initialization: {e}"
+             
+             return "❌ Bot failed to start (generic error, check Render logs)."
 
     except ValueError:
-        return "❌ Error: Chat ID must be an integer (including negative sign for supergroups), and Bad Rolls must be comma-separated numbers."
+        return "❌ Error: Chat ID must be an integer, and Bad Rolls must be comma-separated numbers."
     except Exception as e:
         return f"❌ An unexpected error occurred during startup: {e}"
 
@@ -223,18 +239,12 @@ async def stop_bot():
         return "⚠️ Bot is not running."
     
     try:
-        # Cancel the task which is blocked on asyncio.Future()
-        if app and hasattr(app, 'stop'):
-            # The client task is waiting on asyncio.Future(), we need to manually cancel it 
-            # to let the finally block execute app.stop() and clean up.
-            
-            # Find the running client task and cancel it.
-            tasks = [t for t in asyncio.all_tasks() if t.get_name() == 'Task-Pyrogram-Client']
-            for task in tasks:
-                 task.cancel()
+        # Find the running client task and cancel it.
+        tasks = [t for t in asyncio.all_tasks() if t.get_name() == 'Pyrogram-Client-Task']
+        for task in tasks:
+             task.cancel()
                  
-            # Wait a moment for cleanup
-            await asyncio.sleep(1)
+        await asyncio.sleep(1) # Give it time to enter the finally block and call app.stop()
             
         client_running.clear()
         return "🛑 Bot successfully stopped."
@@ -248,8 +258,8 @@ def create_gradio_ui():
     with gr.Blocks(title="Pyrogram Dice Manager Bot") as demo:
         gr.Markdown("# Pyrogram Dice Manager Bot (Render Ready)")
         gr.Markdown(
-            "Set your **API_ID**, **API_HASH**, and **STRING_SESSION** as environment variables on Render. "
-            "Then configure the target chat and bad rolls below to start monitoring."
+            "Set your **API_ID**, **API_HASH**, and **STRING_SESSION** as **Environment Variables** on Render. "
+            "Then configure the target chat and bad rolls below to start monitoring. Check your Render console logs for detailed connection errors."
         )
 
         with gr.Row():
@@ -273,9 +283,8 @@ def create_gradio_ui():
             stop_btn = gr.Button("🛑 Stop Bot", variant="secondary")
 
         gr.Markdown("---")
-        gr.Markdown("### Bot Activity Log")
+        gr.Markdown("### Bot Activity Log (Initial connection errors are logged to the Render console.)")
         
-        # Connect buttons to functions
         start_btn.click(
             start_bot,
             inputs=[chat_id_input, bad_rolls_input],
@@ -291,16 +300,13 @@ def create_gradio_ui():
 
 # --- ENTRY POINT ---
 if __name__ == "__main__":
-    # 1. Install uvloop for faster async operations
     if sys.platform != 'win32':
         try:
             uvloop.install()
             print("[PERFORMANCE] uvloop installed successfully.")
         except Exception as e:
-            # Fallback if uvloop is not available/installable
             print(f"[PERFORMANCE] uvloop not used: {e}") 
 
-    # 2. Run the Gradio UI
     ui = create_gradio_ui()
     # Use 0.0.0.0 and the PORT environment variable for Render deployment
     ui.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
