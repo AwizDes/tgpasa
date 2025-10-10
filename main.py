@@ -5,8 +5,8 @@ from pyrogram import Client
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ========== CONFIG ==========
-MONGO_URI = "your_mongo_connection_string"
-DB_NAME = "dicebot"
+MONGO_URI = os.environ.get("MONGO_URI")
+DB_NAME = "tgpasa"
 COLLECTION_NAME = "settings"
 SESSION_DIR = "./sessions"
 # ============================
@@ -127,3 +127,4 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
 demo.queue()
 demo.launch(server_name="0.0.0.0", server_port=10000)
+
