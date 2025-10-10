@@ -50,6 +50,7 @@ log_queue = queue.Queue()
 bot_thread = None
 bot_loop = None
 accumulated_logs = []
+stop_event = None
 
 # Configuration from UI
 TARGET_CHAT_ID = None
@@ -157,7 +158,9 @@ async def handle_dice(client, message):
 
 
 async def start_monitoring():
-    global app
+    global app, stop_event
+    
+    stop_event = asyncio.Event()
     
     # Use string session if available, otherwise use file-based session
     if SESSION_STRING:
@@ -179,7 +182,7 @@ async def start_monitoring():
         log(f"[Config] Bad rolls: {BAD_ROLLS}")
         log(f"[Config] Target: {TARGET_GOOD_DICE} total dice before cleanup")
         log("[Wait] Waiting for ANY dice rolls in the target chat...\n")
-        await asyncio.Event().wait()
+        await stop_event.wait()
 
 
 def run_bot_in_thread():
@@ -201,12 +204,22 @@ def run_bot_in_thread():
         bot_loop.run_until_complete(start_monitoring())
     except Exception as e:
         log(f"[Error] Bot error: {e}")
-        is_running = False
     finally:
+        is_running = False
+        # Proper cleanup: cancel all pending tasks
         try:
-            bot_loop.close()
-        except:
-            pass
+            pending = asyncio.all_tasks(bot_loop)
+            for task in pending:
+                task.cancel()
+            # Wait for all tasks to complete cancellation
+            bot_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception as e:
+            log(f"[Debug] Task cleanup: {e}")
+        finally:
+            try:
+                bot_loop.close()
+            except:
+                pass
 
 
 def start_bot(chat_id, bad_rolls_input, target_dice):
@@ -244,18 +257,23 @@ def start_bot(chat_id, bad_rolls_input, target_dice):
 
 
 def stop_bot():
-    global is_running, app, bot_loop
+    global is_running, app, bot_loop, stop_event
     if not is_running:
         return "[Error] Bot is not running!"
     
+    log("[Stop] Stopping bot gracefully...")
     is_running = False
-    if app:
+    
+    # Signal the monitoring loop to stop
+    if stop_event and bot_loop:
         try:
-            if bot_loop and bot_loop.is_running():
-                bot_loop.call_soon_threadsafe(bot_loop.stop)
-            app.stop()
+            bot_loop.call_soon_threadsafe(stop_event.set)
         except Exception as e:
-            log(f"Error stopping bot: {e}")
+            log(f"[Debug] Error setting stop event: {e}")
+    
+    # Wait a moment for graceful shutdown
+    import time
+    time.sleep(1)
     
     log("[Stop] Bot stopped!")
     return "[Stop] Bot stopped!"
