@@ -335,8 +335,8 @@ with gr.Blocks(title="Telegram Dice") as demo:
         with gr.Column():
             chat_id_input = gr.Textbox(
                 label="Target Chat ID",
-                placeholder="-1003107059457",
-                value="-1003107059457"
+                placeholder="enter chat ID starts from -100",
+                value="-1003151338912"
             )
             bad_rolls_input = gr.Textbox(
                 label="Bad Rolls (comma-separated)",
@@ -384,3 +384,4 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+
