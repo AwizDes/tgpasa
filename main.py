@@ -2,12 +2,28 @@ import asyncio
 import sys
 import os
 import queue
+import logging
+import warnings
 from threading import Thread
 from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.raw.functions.channels import DeleteMessages
 from dotenv import load_dotenv
 import gradio as gr
+
+# Suppress Pyrogram's peer resolution errors and asyncio warnings
+logging.getLogger("pyrogram").setLevel(logging.CRITICAL)
+logging.getLogger("pyrogram.client").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore")
+
+# Suppress "Task exception was never retrieved" errors
+def custom_exception_handler(loop, context):
+    # Only suppress peer resolution errors, log others
+    exception = context.get('exception')
+    if exception and 'Peer id invalid' in str(exception):
+        return  # Silently ignore peer resolution errors
+    # Log other exceptions normally
+    loop.default_exception_handler(context)
 
 # Use uvloop for better performance (Unix only)
 if sys.platform != 'win32':
@@ -195,24 +211,17 @@ async def start_monitoring():
     else:
         app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH)
     
+    # Listen to all dice messages, filter in handler (avoids peer resolution errors)
+    @app.on_message(filters.dice)
+    async def dice_handler(client, message):
+        # Only process if from target chat
+        if message.chat.id == TARGET_CHAT_ID:
+            await handle_dice(client, message)
+    
     async with app:
         me = await app.get_me()
         log(f"[Start] Running as {me.first_name} (ID: {me.id})")
-        
-        # Fetch the chat to ensure it's in the session cache
-        try:
-            chat = await app.get_chat(TARGET_CHAT_ID)
-            log(f"[Target] Connected to chat: {chat.title if chat.title else 'Private Chat'}")
-        except Exception as e:
-            log(f"[Error] Cannot access chat {TARGET_CHAT_ID}: {e}")
-            log("[Error] Make sure the bot is a member of this chat!")
-            return
-        
-        # Register handler AFTER confirming chat access - filter by specific chat only
-        @app.on_message(filters.chat(TARGET_CHAT_ID) & filters.dice)
-        async def dice_handler(client, message):
-            await handle_dice(client, message)
-        
+        log(f"[Target] Monitoring chat ID: {TARGET_CHAT_ID}")
         log(f"[Config] Bad rolls: {BAD_ROLLS}, Target: {TARGET_GOOD_DICE}")
         log("[Wait] Waiting for dice rolls...\n")
         await stop_event.wait()
@@ -230,6 +239,9 @@ def run_bot_in_thread():
             bot_loop = asyncio.new_event_loop()
     else:
         bot_loop = asyncio.new_event_loop()
+    
+    # Set custom exception handler to suppress peer resolution errors
+    bot_loop.set_exception_handler(custom_exception_handler)
     
     asyncio.set_event_loop(bot_loop)
     try:
@@ -335,7 +347,7 @@ with gr.Blocks(title="Telegram Dice") as demo:
         with gr.Column():
             chat_id_input = gr.Textbox(
                 label="Target Chat ID",
-                placeholder="enter chat ID starts from -100",
+                placeholder="enter group Id start from -100",
                 value="-1003151338912"
             )
             bad_rolls_input = gr.Textbox(
@@ -384,4 +396,3 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port, share=False)
-
