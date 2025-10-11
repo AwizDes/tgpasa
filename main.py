@@ -195,14 +195,25 @@ async def start_monitoring():
     else:
         app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH)
     
-    @app.on_message(filters.chat(TARGET_CHAT_ID) & filters.dice)
-    async def dice_handler(client, message):
-        await handle_dice(client, message)
-    
     async with app:
         me = await app.get_me()
         log(f"[Start] Running as {me.first_name} (ID: {me.id})")
-        log(f"[Target] Chat: {TARGET_CHAT_ID}, Bad rolls: {BAD_ROLLS}, Target: {TARGET_GOOD_DICE}")
+        
+        # Fetch the chat to ensure it's in the session cache
+        try:
+            chat = await app.get_chat(TARGET_CHAT_ID)
+            log(f"[Target] Connected to chat: {chat.title if chat.title else 'Private Chat'}")
+        except Exception as e:
+            log(f"[Error] Cannot access chat {TARGET_CHAT_ID}: {e}")
+            log("[Error] Make sure the bot is a member of this chat!")
+            return
+        
+        # Register handler AFTER confirming chat access - filter by specific chat only
+        @app.on_message(filters.chat(TARGET_CHAT_ID) & filters.dice)
+        async def dice_handler(client, message):
+            await handle_dice(client, message)
+        
+        log(f"[Config] Bad rolls: {BAD_ROLLS}, Target: {TARGET_GOOD_DICE}")
         log("[Wait] Waiting for dice rolls...\n")
         await stop_event.wait()
 
