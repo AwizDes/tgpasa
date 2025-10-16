@@ -40,6 +40,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
+ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")  # Password from env
 
 if not SESSION_STRING and os.path.exists("session_string.txt"):
     with open("session_string.txt", "r") as f:
@@ -339,60 +340,135 @@ def get_logs():
     return "\n".join(accumulated_logs) if accumulated_logs else ""
 
 
-# Gradio UI
-with gr.Blocks(title="Telegram Dice") as demo:
-    gr.Markdown("# Telegram Dice Controller")
-    
-    with gr.Row():
-        with gr.Column():
-            chat_id_input = gr.Textbox(
-                label="Target Chat ID",
-                placeholder="enter group Id start from -100",
-                value="-1003151338912"
-            )
-            bad_rolls_input = gr.Textbox(
-                label="Bad Rolls (comma-separated)",
-                placeholder="3,4",
-                value="3,4"
-            )
-            target_dice_input = gr.Textbox(
-                label="Target Good Dice Count",
-                placeholder="6",
-                value="6"
-            )
-            
-            with gr.Row():
-                start_btn = gr.Button("Start Bot", variant="primary")
-                stop_btn = gr.Button("Stop Bot", variant="stop")
-            
-            status_output = gr.Textbox(label="Status", interactive=False)
+def verify_password(password):
+    """Verify the entered password"""
+    if not ACCESS_PASSWORD:
+        # If no password is set, allow access
+        return True
+    return password == ACCESS_PASSWORD
+
+
+def create_main_interface():
+    """Create the main bot control interface"""
+    with gr.Column():
+        gr.Markdown("# Telegram Dice Controller")
         
-        with gr.Column():
-            gr.Markdown("### Live Logs")
-            log_output = gr.Textbox(
-                label="Bot Logs",
-                lines=20,
-                max_lines=30,
-                interactive=False,
-                autoscroll=True
-            )
+        with gr.Row():
+            with gr.Column():
+                chat_id_input = gr.Textbox(
+                    label="Target Chat ID",
+                    placeholder="enter group Id start from -100",
+                    value="-1003012011721"
+                )
+                bad_rolls_input = gr.Textbox(
+                    label="Bad Rolls (comma-separated)",
+                    placeholder="3,4",
+                    value="3,4"
+                )
+                target_dice_input = gr.Textbox(
+                    label="Target Good Dice Count",
+                    placeholder="6",
+                    value="6"
+                )
+                
+                with gr.Row():
+                    start_btn = gr.Button("Start Bot", variant="primary")
+                    stop_btn = gr.Button("Stop Bot", variant="stop")
+                
+                status_output = gr.Textbox(label="Status", interactive=False)
+            
+            with gr.Column():
+                gr.Markdown("### Live Logs")
+                log_output = gr.Textbox(
+                    label="Bot Logs",
+                    lines=20,
+                    max_lines=30,
+                    interactive=False,
+                    autoscroll=True
+                )
+        
+        start_btn.click(
+            fn=start_bot,
+            inputs=[chat_id_input, bad_rolls_input, target_dice_input],
+            outputs=[status_output, log_output]
+        )
+        
+        stop_btn.click(fn=stop_bot, outputs=[status_output])
+        
+        timer = gr.Timer(value=0.5, active=True)
+        timer.tick(fn=get_logs, outputs=[log_output])
+
+
+def create_login_interface():
+    """Create the password login interface"""
+    with gr.Column():
+        gr.Markdown("# 🔐 Access Required")
+        gr.Markdown("Please enter the password to access the Telegram Dice Controller")
+        
+        password_input = gr.Textbox(
+            label="Password",
+            type="password",
+            placeholder="Enter password"
+        )
+        login_btn = gr.Button("Login", variant="primary")
+        error_msg = gr.Markdown("", visible=False)
+        
+        return password_input, login_btn, error_msg
+
+
+# Gradio UI with authentication
+with gr.Blocks(title="Telegram Dice") as demo:
+    # State to track authentication
+    authenticated = gr.State(False)
     
-    start_btn.click(
-        fn=start_bot,
-        inputs=[chat_id_input, bad_rolls_input, target_dice_input],
-        outputs=[status_output, log_output]
+    # Login interface
+    with gr.Group(visible=True) as login_group:
+        password_input, login_btn, error_msg = create_login_interface()
+    
+    # Main interface (hidden initially)
+    with gr.Group(visible=False) as main_group:
+        create_main_interface()
+    
+    def login(password, auth_state):
+        """Handle login attempt"""
+        if verify_password(password):
+            return {
+                authenticated: True,
+                login_group: gr.update(visible=False),
+                main_group: gr.update(visible=True),
+                error_msg: gr.update(visible=False)
+            }
+        else:
+            return {
+                authenticated: False,
+                login_group: gr.update(visible=True),
+                main_group: gr.update(visible=False),
+                error_msg: gr.update("❌ Invalid password. Please try again.", visible=True)
+            }
+    
+    login_btn.click(
+        fn=login,
+        inputs=[password_input, authenticated],
+        outputs=[authenticated, login_group, main_group, error_msg]
     )
     
-    stop_btn.click(fn=stop_bot, outputs=[status_output])
-    
-    timer = gr.Timer(value=0.5, active=True)
-    timer.tick(fn=get_logs, outputs=[log_output])
+    # Allow Enter key to submit password
+    password_input.submit(
+        fn=login,
+        inputs=[password_input, authenticated],
+        outputs=[authenticated, login_group, main_group, error_msg]
+    )
 
 
 if __name__ == "__main__":
     if not API_ID or not API_HASH:
         print("[Error] API_ID and API_HASH must be set in .env file!")
         exit(1)
+    
+    if not ACCESS_PASSWORD:
+        print("[Warning] No ACCESS_PASSWORD set in .env file. Access will be unrestricted!")
+    else:
+        print("[Security] Password authentication enabled.")
     
     port = int(os.getenv("PORT", 7860))
     demo.launch(server_name="0.0.0.0", server_port=port, share=False)
