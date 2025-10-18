@@ -7,7 +7,6 @@ import warnings
 from threading import Thread
 from collections import defaultdict
 from pyrogram import Client, filters
-from pyrogram.raw.functions.channels import DeleteMessages
 from dotenv import load_dotenv
 import gradio as gr
 
@@ -18,11 +17,9 @@ warnings.filterwarnings("ignore")
 
 # Suppress "Task exception was never retrieved" errors
 def custom_exception_handler(loop, context):
-    # Only suppress peer resolution errors, log others
     exception = context.get('exception')
     if exception and 'Peer id invalid' in str(exception):
-        return  # Silently ignore peer resolution errors
-    # Log other exceptions normally
+        return
     loop.default_exception_handler(context)
 
 # Use uvloop for better performance (Unix only)
@@ -40,14 +37,16 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")  # Password from env
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD", "")
 
 if not SESSION_STRING and os.path.exists("session_string.txt"):
     with open("session_string.txt", "r") as f:
         SESSION_STRING = f.read().strip()
 
 # Global state
-app = None
+user_client = None
+bot_client = None
 good_dice_count = 0
 bad_roll_occurrences = defaultdict(int)
 messages_to_delete = []
@@ -74,44 +73,52 @@ def log(message):
 
 
 async def send_replacement_until_good(client, chat_id):
-    """Keep rolling until a good roll appears"""
+    """Keep rolling until a good roll appears (max 3 attempts)"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls, all_good_messages
 
+    max_retries = 3
+    attempt = 0
+    
     try:
-        while True:
+        while attempt < max_retries:
+            attempt += 1
             new_msg = await client.send_dice(chat_id)
             val = new_msg.dice.value
-            log(f" -> Replacement rolled {val}")
 
             if val in BAD_ROLLS:
                 occurrence_before = bad_roll_occurrences[val]
+                
+                if occurrence_before == 0:
+                    bad_roll_occurrences[val] += 1
+                    messages_to_delete.append(new_msg)
+                    last_bad_rolls[val] = new_msg
+                    good_dice_count += 1
+                    all_good_messages.append(new_msg)
+                    log(f"First bad {val} → counted as good ({good_dice_count}/{TARGET_GOOD_DICE})")
+                    return new_msg
+                
                 bad_roll_occurrences[val] += 1
                 messages_to_delete.append(new_msg)
                 last_bad_rolls[val] = new_msg
-                
-                if occurrence_before == 0:
-                    good_dice_count += 1
-                    all_good_messages.append(new_msg)
-                    log(f" OK First occurrence of bad roll {val} in replacement -> total {good_dice_count}")
-                    return new_msg
-                
-                log(f" X Bad replacement {val} (occurrence #{bad_roll_occurrences[val]}), retrying...")
-                await asyncio.sleep(0.3)
                 continue
 
             good_dice_count += 1
             all_good_messages.append(new_msg)
-            log(f" OK Replacement accepted good {val} -> total {good_dice_count}")
+            log(f"Replacement {val} → good ({good_dice_count}/{TARGET_GOOD_DICE})")
             return new_msg
+        
+        log(f"Max retries reached")
+        return None
+        
     except asyncio.CancelledError:
-        log(f" [!] Replacement task cancelled")
         raise
     except Exception as e:
-        log(f" [Error] Replacement error: {e}")
+        log(f"Error: {e}")
+        return None
 
 
 async def perform_batch_deletion():
-    """Delete bad messages (except latest of each) and excess good messages"""
+    """Delete bad messages (except latest of each) and excess good messages using bot client"""
     try:
         keep_bad_ids = {msg.id for msg in last_bad_rolls.values() if msg}
         all_bad_ids = {msg.id for msg in messages_to_delete if msg}
@@ -120,21 +127,18 @@ async def perform_batch_deletion():
         delete_excess_good_ids = []
         if len(all_good_messages) > TARGET_GOOD_DICE:
             excess_count = len(all_good_messages) - TARGET_GOOD_DICE
-            log(f"[Clean] Found {len(all_good_messages)} good dice, deleting {excess_count} excess...")
             excess_messages = all_good_messages[:excess_count]
             delete_excess_good_ids = [msg.id for msg in excess_messages if msg]
         
         all_delete_ids = delete_bad_ids + delete_excess_good_ids
         
         if all_delete_ids:
-            log(f"[Clean] Deleting {len(delete_bad_ids)} bad rolls, {len(delete_excess_good_ids)} excess good rolls...")
-            peer = await app.resolve_peer(TARGET_CHAT_ID)
-            await app.invoke(DeleteMessages(channel=peer, id=all_delete_ids))
-            log(f"[OK] Deleted {len(all_delete_ids)} messages. Kept exactly {TARGET_GOOD_DICE} good dice.")
+            await bot_client.delete_messages(TARGET_CHAT_ID, all_delete_ids)
+            log(f"Deleted {len(all_delete_ids)} messages. Kept {TARGET_GOOD_DICE} good dice.")
         else:
-            log(f"[Clean] No messages to delete. Exactly {TARGET_GOOD_DICE} good dice present.")
+            log(f"No deletion needed. Exactly {TARGET_GOOD_DICE} good dice.")
     except Exception as e:
-        log(f"[Error] Deletion error: {e}")
+        log(f"Deletion error: {e}")
 
 
 def reset_session():
@@ -145,7 +149,6 @@ def reset_session():
     for task in list(active_replacement_tasks):
         if not task.done():
             task.cancel()
-            log(f"[Cancel] Cancelled running replacement task")
     
     good_dice_count = 0
     bad_roll_occurrences.clear()
@@ -164,8 +167,8 @@ async def handle_dice(client, message):
         return
 
     val = message.dice.value
-    sender_name = message.from_user.first_name if message.from_user else "Unknown User"
-    log(f"[Dice] {sender_name} rolled: {val} ({good_dice_count + 1}/{TARGET_GOOD_DICE})")
+    sender = message.from_user.first_name if message.from_user else "Unknown"
+    log(f"{sender} rolled {val} ({good_dice_count + 1}/{TARGET_GOOD_DICE})")
 
     if val in BAD_ROLLS:
         bad_roll_occurrences[val] += 1
@@ -176,55 +179,47 @@ async def handle_dice(client, message):
         if occurrence == 1:
             good_dice_count += 1
             all_good_messages.append(message)
-            log(f"[Warning] First occurrence of bad roll {val}: counted as good.")
+            log(f"First bad {val} → counted as good")
         else:
-            log(f"[X] Duplicate bad roll {val} - sending replacements.")
-            task = asyncio.create_task(send_replacement_until_good(client, message.chat.id))
+            log(f"Duplicate bad {val} → replacing")
+            task = asyncio.create_task(send_replacement_until_good(user_client, message.chat.id))
             active_replacement_tasks.add(task)
             task.add_done_callback(lambda t: active_replacement_tasks.discard(t))
-            await task
     else:
         good_dice_count += 1
         all_good_messages.append(message)
-        log(f"[OK] Good roll: {val} -> total {good_dice_count}")
 
     if good_dice_count >= TARGET_GOOD_DICE:
-        log(f"\n[Target] Target reached ({good_dice_count}/{TARGET_GOOD_DICE}).")
-        
-        if active_replacement_tasks:
-            log(f"[Wait] Waiting for {len(active_replacement_tasks)} remaining replacement task(s)...")
-            await asyncio.gather(*active_replacement_tasks, return_exceptions=True)
-            log(f"[Wait] All replacements complete. Final count: {good_dice_count}")
-        
+        log(f"Target reached! Cleaning up...")
         await perform_batch_deletion()
         reset_session()
-        log("[OK] Round complete! Ready for next one.\n")
+        log("Ready for next round\n")
 
 
 async def start_monitoring():
-    """Start the Telegram client and monitor dice"""
-    global app, stop_event
+    """Start both Telegram clients and monitor dice"""
+    global user_client, bot_client, stop_event
     
     stop_event = asyncio.Event()
     
     if SESSION_STRING:
-        app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
     else:
-        app = Client("tgpasa", api_id=API_ID, api_hash=API_HASH)
+        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH)
     
-    # Listen to all dice messages, filter in handler (avoids peer resolution errors)
-    @app.on_message(filters.dice)
+    bot_client = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+    
+    @user_client.on_message(filters.dice)
     async def dice_handler(client, message):
-        # Only process if from target chat
         if message.chat.id == TARGET_CHAT_ID:
             await handle_dice(client, message)
     
-    async with app:
-        me = await app.get_me()
-        log(f"[Start] Running as {me.first_name} (ID: {me.id})")
-        log(f"[Target] Monitoring chat ID: {TARGET_CHAT_ID}")
-        log(f"[Config] Bad rolls: {BAD_ROLLS}, Target: {TARGET_GOOD_DICE}")
-        log("[Wait] Waiting for dice rolls...\n")
+    async with user_client, bot_client:
+        user_me = await user_client.get_me()
+        bot_me = await bot_client.get_me()
+        log(f"User: {user_me.first_name} | Bot: @{bot_me.username}")
+        log(f"Monitoring chat: {TARGET_CHAT_ID}")
+        log(f"Bad rolls: {BAD_ROLLS} | Target: {TARGET_GOOD_DICE}\n")
         await stop_event.wait()
 
 
@@ -241,14 +236,13 @@ def run_bot_in_thread():
     else:
         bot_loop = asyncio.new_event_loop()
     
-    # Set custom exception handler to suppress peer resolution errors
     bot_loop.set_exception_handler(custom_exception_handler)
     
     asyncio.set_event_loop(bot_loop)
     try:
         bot_loop.run_until_complete(start_monitoring())
     except Exception as e:
-        log(f"[Error] Bot error: {e}")
+        log(f"Error: {e}")
     finally:
         is_running = False
         try:
@@ -270,7 +264,7 @@ def start_bot(chat_id, bad_rolls_input, target_dice):
     global TARGET_CHAT_ID, BAD_ROLLS, TARGET_GOOD_DICE, is_running, bot_thread, accumulated_logs
     
     if is_running:
-        return "[Error] Bot is already running!", ""
+        return "Bot already running!", ""
     
     try:
         accumulated_logs.clear()
@@ -281,46 +275,49 @@ def start_bot(chat_id, bad_rolls_input, target_dice):
         TARGET_GOOD_DICE = int(target_dice)
         
         if not all(1 <= x <= 6 for x in BAD_ROLLS):
-            return "[Error] Bad rolls must be between 1 and 6!", ""
+            return "Bad rolls must be 1-6!", ""
         
         if len(BAD_ROLLS) >= 6:
-            return "[Error] You must have at least one good roll!", ""
+            return "Must have at least one good roll!", ""
         
         is_running = True
         bot_thread = Thread(target=run_bot_in_thread, daemon=True)
         bot_thread.start()
         
-        return "[OK] Bot started successfully!", "[Start] Bot is initializing..."
+        return "Bot started!", "Initializing..."
         
     except ValueError as e:
         is_running = False
-        return f"[Error] Invalid input: {e}", ""
+        return f"Invalid input: {e}", ""
     except Exception as e:
         is_running = False
-        return f"[Error] Error starting bot: {e}", ""
+        return f"Error: {e}", ""
 
 
 def stop_bot():
     """Stop the bot gracefully"""
-    global is_running, stop_event, bot_loop
+    global is_running, stop_event, bot_loop, accumulated_logs
     
     if not is_running:
-        return "[Error] Bot is not running!"
+        return "Bot not running!"
     
-    log("[Stop] Stopping bot gracefully...")
+    log("Stopping...")
     is_running = False
+    
+    reset_session()
+    accumulated_logs.clear()
     
     if stop_event and bot_loop:
         try:
             bot_loop.call_soon_threadsafe(stop_event.set)
-        except Exception as e:
-            log(f"[Debug] Error setting stop event: {e}")
+        except:
+            pass
     
     import time
     time.sleep(1)
     
-    log("[Stop] Bot stopped!")
-    return "[Stop] Bot stopped!"
+    log("Bot stopped!")
+    return "Bot stopped!"
 
 
 def get_logs():
@@ -343,7 +340,6 @@ def get_logs():
 def verify_password(password):
     """Verify the entered password"""
     if not ACCESS_PASSWORD:
-        # If no password is set, allow access
         return True
     return password == ACCESS_PASSWORD
 
@@ -352,13 +348,14 @@ def create_main_interface():
     """Create the main bot control interface"""
     with gr.Column():
         gr.Markdown("# Telegram Dice Controller")
+        gr.Markdown("**User Bot:** Sends dice | **Bot:** Deletes messages")
         
         with gr.Row():
             with gr.Column():
                 chat_id_input = gr.Textbox(
                     label="Target Chat ID",
                     placeholder="enter group Id start from -100",
-                    value="-1003012011721"
+                    value="-1003151338912"
                 )
                 bad_rolls_input = gr.Textbox(
                     label="Bad Rolls (comma-separated)",
@@ -418,14 +415,11 @@ def create_login_interface():
 
 # Gradio UI with authentication
 with gr.Blocks(title="Telegram Dice") as demo:
-    # State to track authentication
     authenticated = gr.State(False)
     
-    # Login interface
     with gr.Group(visible=True) as login_group:
         password_input, login_btn, error_msg = create_login_interface()
     
-    # Main interface (hidden initially)
     with gr.Group(visible=False) as main_group:
         create_main_interface()
     
@@ -452,7 +446,6 @@ with gr.Blocks(title="Telegram Dice") as demo:
         outputs=[authenticated, login_group, main_group, error_msg]
     )
     
-    # Allow Enter key to submit password
     password_input.submit(
         fn=login,
         inputs=[password_input, authenticated],
@@ -463,6 +456,10 @@ with gr.Blocks(title="Telegram Dice") as demo:
 if __name__ == "__main__":
     if not API_ID or not API_HASH:
         print("[Error] API_ID and API_HASH must be set in .env file!")
+        exit(1)
+    
+    if not BOT_TOKEN:
+        print("[Error] BOT_TOKEN must be set in .env file!")
         exit(1)
     
     if not ACCESS_PASSWORD:
