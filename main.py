@@ -54,6 +54,7 @@ last_bad_rolls = {}
 all_good_messages = []
 active_replacement_tasks = set()
 is_running = False
+is_cleaning = False
 log_queue = queue.Queue()
 bot_thread = None
 bot_loop = None
@@ -72,11 +73,24 @@ def log(message):
     log_queue.put(message)
 
 
+async def check_and_cleanup():
+    """Check if target reached and perform cleanup (with race condition protection)"""
+    global good_dice_count, is_cleaning
+    
+    if good_dice_count >= TARGET_GOOD_DICE and not is_cleaning:
+        is_cleaning = True
+        log(f"Target reached! Cleaning up...")
+        await perform_batch_deletion()
+        reset_session()
+        is_cleaning = False
+        log("Ready for next round\n")
+
+
 async def send_replacement_until_good(client, chat_id):
     """Keep rolling until a good roll appears (max 50 attempts)"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls, all_good_messages
 
-    max_retries = 10
+    max_retries = 50
     attempt = 0
     
     try:
@@ -144,7 +158,7 @@ async def perform_batch_deletion():
 def reset_session():
     """Reset all tracking variables and cancel active tasks"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
-    global active_replacement_tasks, all_good_messages
+    global active_replacement_tasks, all_good_messages, is_cleaning
     
     for task in list(active_replacement_tasks):
         if not task.done():
@@ -156,6 +170,7 @@ def reset_session():
     last_bad_rolls.clear()
     all_good_messages.clear()
     active_replacement_tasks.clear()
+    is_cleaning = False
 
 
 async def handle_dice(client, message):
@@ -188,12 +203,9 @@ async def handle_dice(client, message):
     else:
         good_dice_count += 1
         all_good_messages.append(message)
-
-    if good_dice_count >= TARGET_GOOD_DICE:
-        log(f"Target reached! Cleaning up...")
-        await perform_batch_deletion()
-        reset_session()
-        log("Ready for next round\n")
+    
+    # Single check point after all dice processing
+    await check_and_cleanup()
 
 
 async def start_monitoring():
