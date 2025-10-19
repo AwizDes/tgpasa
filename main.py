@@ -73,10 +73,10 @@ def log(message):
 
 
 async def send_replacement_until_good(client, chat_id):
-    """Keep rolling until a good roll appears (max 3 attempts)"""
+    """Keep rolling until a good roll appears (max 50 attempts)"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls, all_good_messages
 
-    max_retries = 3
+    max_retries = 10
     attempt = 0
     
     try:
