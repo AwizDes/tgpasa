@@ -92,12 +92,14 @@ async def send_replacement_until_good(client, chat_id):
 
     max_retries = 50
     attempt = 0
+    last_msg = None
     
     try:
         while attempt < max_retries:
             attempt += 1
             new_msg = await client.send_dice(chat_id)
             val = new_msg.dice.value
+            last_msg = new_msg
 
             if val in BAD_ROLLS:
                 occurrence_before = bad_roll_occurrences[val]
@@ -121,8 +123,12 @@ async def send_replacement_until_good(client, chat_id):
             log(f"Replacement {val} → good ({good_dice_count}/{TARGET_GOOD_DICE})")
             return new_msg
         
-        log(f"Max retries reached")
-        return None
+        # Max retries reached - count the last roll as good anyway
+        if last_msg:
+            good_dice_count += 1
+            all_good_messages.append(last_msg)
+            log(f"Max retries reached, accepting last roll ({good_dice_count}/{TARGET_GOOD_DICE})")
+        return last_msg
         
     except asyncio.CancelledError:
         raise
@@ -183,7 +189,6 @@ async def handle_dice(client, message):
 
     val = message.dice.value
     sender = message.from_user.first_name if message.from_user else "Unknown"
-    log(f"{sender} rolled {val} ({good_dice_count + 1}/{TARGET_GOOD_DICE})")
 
     if val in BAD_ROLLS:
         bad_roll_occurrences[val] += 1
@@ -194,15 +199,20 @@ async def handle_dice(client, message):
         if occurrence == 1:
             good_dice_count += 1
             all_good_messages.append(message)
-            log(f"First bad {val} → counted as good")
+            log(f"{sender} rolled {val} - First bad → counted as good ({good_dice_count}/{TARGET_GOOD_DICE})")
         else:
-            log(f"Duplicate bad {val} → replacing")
+            log(f"{sender} rolled {val} - Duplicate bad → replacing")
             task = asyncio.create_task(send_replacement_until_good(user_client, message.chat.id))
             active_replacement_tasks.add(task)
             task.add_done_callback(lambda t: active_replacement_tasks.discard(t))
     else:
         good_dice_count += 1
         all_good_messages.append(message)
+        log(f"{sender} rolled {val} ({good_dice_count}/{TARGET_GOOD_DICE})")
+    
+    # Wait for all replacement tasks to complete before checking
+    if active_replacement_tasks:
+        await asyncio.gather(*list(active_replacement_tasks), return_exceptions=True)
     
     # Single check point after all dice processing
     await check_and_cleanup()
