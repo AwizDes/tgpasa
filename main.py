@@ -53,6 +53,7 @@ messages_to_delete = []
 last_bad_rolls = {}
 all_good_messages = []
 active_replacement_tasks = set()
+accepted_bad_at_max_retries = 0  # NEW: Counter for top-up
 is_running = False
 is_cleaning = False
 log_queue = queue.Queue()
@@ -73,6 +74,18 @@ def log(message):
     log_queue.put(message)
 
 
+async def top_up_missing_dice():
+    """Send additional dice to compensate for accepted bad rolls at max retries"""
+    global accepted_bad_at_max_retries
+    
+    if accepted_bad_at_max_retries > 0:
+        log(f"Sending {accepted_bad_at_max_retries} top-up dice...")
+        for i in range(accepted_bad_at_max_retries):
+            await user_client.send_dice(TARGET_CHAT_ID)
+        log(f"Top-up complete")
+        accepted_bad_at_max_retries = 0
+
+
 async def check_and_cleanup():
     """Check if target reached and perform cleanup (with race condition protection)"""
     global good_dice_count, is_cleaning
@@ -81,16 +94,18 @@ async def check_and_cleanup():
         is_cleaning = True
         log(f"Target reached! Cleaning up...")
         await perform_batch_deletion()
+        await top_up_missing_dice()  # NEW: Top-up after deletion
         reset_session()
         is_cleaning = False
         log("Ready for next round\n")
 
 
 async def send_replacement_until_good(client, chat_id):
-    """Keep rolling until a good roll appears (max 50 attempts)"""
+    """Keep rolling until a good roll appears (max 2 attempts)"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls, all_good_messages
+    global accepted_bad_at_max_retries  # NEW
 
-    max_retries = 50
+    max_retries = 2  # Changed from 50 to 2
     attempt = 0
     last_msg = None
     
@@ -116,6 +131,15 @@ async def send_replacement_until_good(client, chat_id):
                 bad_roll_occurrences[val] += 1
                 messages_to_delete.append(new_msg)
                 last_bad_rolls[val] = new_msg
+                
+                # If this is the last attempt, accept it and move on
+                if attempt == max_retries:
+                    accepted_bad_at_max_retries += 1  # NEW: Increment counter
+                    good_dice_count += 1
+                    all_good_messages.append(new_msg)
+                    log(f"Max retries reached (attempt {attempt}), accepting bad roll {val} ({good_dice_count}/{TARGET_GOOD_DICE})")
+                    return new_msg
+                
                 continue
 
             good_dice_count += 1
@@ -123,11 +147,11 @@ async def send_replacement_until_good(client, chat_id):
             log(f"Replacement {val} → good ({good_dice_count}/{TARGET_GOOD_DICE})")
             return new_msg
         
-        # Max retries reached - count the last roll as good anyway
+        # Fallback (shouldn't reach here, but just in case)
         if last_msg:
             good_dice_count += 1
             all_good_messages.append(last_msg)
-            log(f"Max retries reached, accepting last roll ({good_dice_count}/{TARGET_GOOD_DICE})")
+            log(f"Accepting last roll ({good_dice_count}/{TARGET_GOOD_DICE})")
         return last_msg
         
     except asyncio.CancelledError:
@@ -164,7 +188,7 @@ async def perform_batch_deletion():
 def reset_session():
     """Reset all tracking variables and cancel active tasks"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
-    global active_replacement_tasks, all_good_messages, is_cleaning
+    global active_replacement_tasks, all_good_messages, is_cleaning, accepted_bad_at_max_retries
     
     for task in list(active_replacement_tasks):
         if not task.done():
@@ -176,6 +200,7 @@ def reset_session():
     last_bad_rolls.clear()
     all_good_messages.clear()
     active_replacement_tasks.clear()
+    accepted_bad_at_max_retries = 0  # NEW: Reset counter
     is_cleaning = False
 
 
