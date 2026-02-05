@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Dice Controller</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            padding: 1rem;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: #1a1a1a;
+            padding: 1.5rem;
+            border-radius: 0;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.8);
+            border: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            color: #fff;
+            font-size: 1.5rem;
+            font-weight: normal;
+            letter-spacing: 1px;
+        }
+        
+        .subtitle {
+            color: #888;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+            font-family: monospace;
+        }
+        
+        .logout-btn {
+            padding: 0.5rem 1rem;
+            background: #222;
+            color: #e0e0e0;
+            border: 1px solid #444;
+            border-radius: 0;
+            cursor: pointer;
+            font-size: 0.9rem;
+            text-decoration: none;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .logout-btn:hover {
+            background: #333;
+            border-color: #666;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.5rem;
+        }
+        
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .card {
+            background: #1a1a1a;
+            padding: 1.5rem;
+            border-radius: 0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.8);
+            border: 1px solid #333;
+        }
+        
+        .card h2 {
+            color: #fff;
+            font-size: 1.1rem;
+            margin-bottom: 1rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 1px solid #333;
+            font-weight: normal;
+            letter-spacing: 1px;
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 0.4rem;
+            color: #aaa;
+            font-size: 0.9rem;
+            font-weight: normal;
+            font-family: monospace;
+        }
+        
+        input[type="text"] {
+            width: 100%;
+            padding: 0.6rem;
+            background: #0a0a0a;
+            border: 1px solid #444;
+            border-radius: 0;
+            font-size: 0.95rem;
+            transition: border-color 0.3s;
+            color: #e0e0e0;
+            font-family: 'Courier New', monospace;
+        }
+        
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #888;
+        }
+        
+        .btn-group {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1.5rem;
+        }
+        
+        .btn {
+            flex: 1;
+            padding: 0.75rem;
+            background: #222;
+            border: 1px solid #444;
+            border-radius: 0;
+            font-size: 0.95rem;
+            font-weight: normal;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: #e0e0e0;
+            font-family: 'Courier New', monospace;
+            letter-spacing: 1px;
+        }
+        
+        .btn:hover:not(:disabled) {
+            background: #2a2a2a;
+            border-color: #666;
+        }
+        
+        .btn:active:not(:disabled) {
+            background: #1a1a1a;
+        }
+        
+        .btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        
+        .btn-primary {
+            background: #222;
+            border-color: #555;
+            color: #fff;
+        }
+        
+        .btn-danger {
+            background: #222;
+            border-color: #555;
+            color: #e0e0e0;
+        }
+        
+        .status-bar {
+            background: #1a1a1a;
+            padding: 0.75rem 1rem;
+            border-radius: 0;
+            margin-bottom: 1rem;
+            border-left: 3px solid #555;
+            border-top: 1px solid #333;
+            border-right: 1px solid #333;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .status-bar.success {
+            background: #1a1a1a;
+            border-left-color: #4a4;
+        }
+        
+        .status-bar.error {
+            background: #1a1a1a;
+            border-left-color: #a44;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 0;
+            margin-right: 0.5rem;
+        }
+        
+        .status-indicator.running {
+            background: #4a4;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-indicator.stopped {
+            background: #555;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        .logs-container {
+            background: #0a0a0a;
+            color: #8f8;
+            padding: 1rem;
+            border-radius: 0;
+            height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            border: 1px solid #333;
+        }
+        
+        .log-line {
+            margin-bottom: 0.25rem;
+        }
+        
+        .log-line:last-child {
+            margin-bottom: 0;
+        }
+        
+        .dice-count {
+            font-size: 1.25rem;
+            font-weight: normal;
+            color: #fff;
+            font-family: monospace;
+        }
+        
+        .hint {
+            font-size: 0.85rem;
+            color: #666;
+            margin-top: 0.25rem;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>⚂ Telegram Dice Controller</h1>
+                <p class="subtitle">User Bot: Sends dice | Bot: Deletes messages</p>
+            </div>
+            <a href="/logout" class="logout-btn">Logout</a>
+        </header>
+        
+        <div class="grid">
+            <div class="card">
+                <h2>⚙ Configuration</h2>
+                
+                <div class="form-group">
+                    <label for="chat_id">Target Chat ID</label>
+                    <input type="text" id="chat_id" value="-1003151338912" placeholder="Enter group ID starting with -100">
+                    <p class="hint">Group chat ID (starts with -100)</p>
+                </div>
+                
+                <div class="form-group">
+                    <label for="bad_rolls">Bad Rolls (comma-separated)</label>
+                    <input type="text" id="bad_rolls" value="3,4" placeholder="e.g., 3,4">
+                    <p class="hint">Dice values to replace (1-6)</p>
+                </div>
+                
+                <div class="form-group">
+                    <label for="target_dice">Target Good Dice Count</label>
+                    <input type="text" id="target_dice" value="6" placeholder="e.g., 6">
+                    <p class="hint">Number of good dice before cleanup</p>
+                </div>
+                
+                <div class="btn-group">
+                    <button id="start-btn" class="btn btn-primary">Start Bot</button>
+                    <button id="stop-btn" class="btn btn-danger" disabled>Stop Bot</button>
+                </div>
+                
+                <div id="status" class="status-bar" style="margin-top: 1rem; display: none;">
+                    <span id="status-text">Ready</span>
+                </div>
+                
+                <div class="status-bar" style="margin-top: 1rem;">
+                    <div>
+                        <span class="status-indicator" id="status-dot"></span>
+                        <span id="bot-status">Stopped</span>
+                    </div>
+                    <div class="dice-count">
+                        <span id="dice-count">0</span>/<span id="target-count">6</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h2>❙❙❙ Live Logs</h2>
+                <div class="logs-container" id="logs">
+                    <div class="log-line" style="color: #888;">Waiting for logs...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const chatIdInput = document.getElementById('chat_id');
+        const badRollsInput = document.getElementById('bad_rolls');
+        const targetDiceInput = document.getElementById('target_dice');
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const statusDiv = document.getElementById('status');
+        const statusText = document.getElementById('status-text');
+        const logsContainer = document.getElementById('logs');
+        const statusDot = document.getElementById('status-dot');
+        const botStatus = document.getElementById('bot-status');
+        const diceCount = document.getElementById('dice-count');
+        const targetCount = document.getElementById('target-count');
+        
+        let eventSource = null;
+        
+        // Load initial logs
+        async function loadLogs() {
+            try {
+                const response = await fetch('/get_logs');
+                const data = await response.json();
+                if (data.logs && data.logs.length > 0) {
+                    logsContainer.innerHTML = data.logs.map(log => 
+                        `<div class="log-line">${escapeHtml(log)}</div>`
+                    ).join('');
+                }
+            } catch (error) {
+                console.error('Error loading logs:', error);
+            }
+        }
+        
+        // Start SSE connection for live logs
+        function startSSE() {
+            if (eventSource) {
+                eventSource.close();
+            }
+            
+            eventSource = new EventSource('/stream');
+            
+            eventSource.onmessage = function(event) {
+                if (event.data && event.data.trim()) {
+                    const logLine = document.createElement('div');
+                    logLine.className = 'log-line';
+                    logLine.textContent = event.data;
+                    logsContainer.appendChild(logLine);
+                    logsContainer.scrollTop = logsContainer.scrollHeight;
+                    
+                    // Keep only last 100 log lines in DOM for performance
+                    while (logsContainer.children.length > 100) {
+                        logsContainer.removeChild(logsContainer.firstChild);
+                    }
+                }
+            };
+            
+            eventSource.onerror = function() {
+                console.log('SSE connection error, reconnecting...');
+                setTimeout(startSSE, 5000);
+            };
+        }
+        
+        // Update status
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                
+                if (data.running) {
+                    statusDot.className = 'status-indicator running';
+                    botStatus.textContent = 'Running';
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                } else {
+                    statusDot.className = 'status-indicator stopped';
+                    botStatus.textContent = 'Stopped';
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
+                }
+                
+                diceCount.textContent = data.good_dice;
+                targetCount.textContent = data.target;
+            } catch (error) {
+                console.error('Error updating status:', error);
+            }
+        }
+        
+        // Start bot
+        startBtn.addEventListener('click', async () => {
+            const data = {
+                chat_id: chatIdInput.value,
+                bad_rolls: badRollsInput.value,
+                target_dice: targetDiceInput.value
+            };
+            
+            try {
+                // Clear logs before starting
+                logsContainer.innerHTML = '<div class="log-line" style="color: #888;">Starting bot...</div>';
+                
+                const response = await fetch('/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                
+                const result = await response.json();
+                showStatus(result.message, result.status === 'success');
+                
+                if (result.status === 'success') {
+                    updateStatus();
+                }
+            } catch (error) {
+                showStatus('Error: ' + error.message, false);
+            }
+        });
+        
+        // Stop bot
+        stopBtn.addEventListener('click', async () => {
+            try {
+                const response = await fetch('/stop', { method: 'POST' });
+                const result = await response.json();
+                showStatus(result.message, result.status === 'success');
+                
+                // Clear logs on stop
+                if (result.status === 'success') {
+                    logsContainer.innerHTML = '<div class="log-line" style="color: #888;">Waiting for logs...</div>';
+                }
+                
+                updateStatus();
+            } catch (error) {
+                showStatus('Error: ' + error.message, false);
+            }
+        });
+        
+        // Show status message
+        function showStatus(message, isSuccess) {
+            statusText.textContent = message;
+            statusDiv.className = isSuccess ? 'status-bar success' : 'status-bar error';
+            statusDiv.style.display = 'flex';
+            
+            setTimeout(() => {
+                statusDiv.style.display = 'none';
+            }, 5000);
+        }
+        
+        // Escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Initialize
+        loadLogs();
+        startSSE();
+        updateStatus();
+        setInterval(updateStatus, 3000);
+    </script>
+</body>
+</html>

@@ -4,11 +4,13 @@ import os
 import queue
 import logging
 import warnings
-from threading import Thread
+from threading import Thread, Lock
 from collections import defaultdict
 from pyrogram import Client, filters
 from dotenv import load_dotenv
-import gradio as gr
+from flask import Flask, render_template, request, jsonify, session, Response, redirect, url_for
+from functools import wraps
+import time
 
 # Suppress Pyrogram's peer resolution errors and asyncio warnings
 logging.getLogger("pyrogram").setLevel(logging.CRITICAL)
@@ -53,25 +55,55 @@ messages_to_delete = []
 last_bad_rolls = {}
 all_good_messages = []
 active_replacement_tasks = set()
-accepted_bad_at_max_retries = 0  # NEW: Counter for top-up
+accepted_bad_at_max_retries = 0
 is_running = False
 is_cleaning = False
 log_queue = queue.Queue()
 bot_thread = None
 bot_loop = None
-accumulated_logs = []
 stop_event = None
+
+# Enhanced log management
+log_lock = Lock()
+error_logs = []  # Keep error logs separate
+dice_logs = []   # Clear after each round
+MAX_ERROR_LOGS = 100
+MAX_DICE_LOGS = 50  # Reduced since they're cleared after rounds
 
 # Config from UI
 TARGET_CHAT_ID = None
 BAD_ROLLS = set()
 TARGET_GOOD_DICE = 6
 
+# Flask app
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", os.urandom(24).hex())
 
-def log(message):
-    """Add message to log queue"""
+
+def log(message, is_error=False):
+    """Add message to appropriate log queue with memory management"""
     print(message)
+    
+    with log_lock:
+        if is_error or "Error" in message or "error" in message.lower():
+            error_logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
+            # Keep only last MAX_ERROR_LOGS
+            if len(error_logs) > MAX_ERROR_LOGS:
+                error_logs.pop(0)
+        else:
+            dice_logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
+            # Keep only last MAX_DICE_LOGS
+            if len(dice_logs) > MAX_DICE_LOGS:
+                dice_logs.pop(0)
+    
+    # Also put in queue for SSE
     log_queue.put(message)
+
+
+def clear_dice_logs():
+    """Clear dice logs after successful round"""
+    with log_lock:
+        dice_logs.clear()
 
 
 async def top_up_missing_dice():
@@ -94,8 +126,9 @@ async def check_and_cleanup():
         is_cleaning = True
         log(f"Target reached! Cleaning up...")
         await perform_batch_deletion()
-        await top_up_missing_dice()  # NEW: Top-up after deletion
+        await top_up_missing_dice()
         reset_session()
+        clear_dice_logs()  # Clear dice logs after successful round
         is_cleaning = False
         log("Ready for next round\n")
 
@@ -103,9 +136,9 @@ async def check_and_cleanup():
 async def send_replacement_until_good(client, chat_id):
     """Keep rolling until a good roll appears (max 2 attempts)"""
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls, all_good_messages
-    global accepted_bad_at_max_retries  # NEW
+    global accepted_bad_at_max_retries
 
-    max_retries = 2  # Changed from 50 to 2
+    max_retries = 2
     attempt = 0
     last_msg = None
     
@@ -132,9 +165,8 @@ async def send_replacement_until_good(client, chat_id):
                 messages_to_delete.append(new_msg)
                 last_bad_rolls[val] = new_msg
                 
-                # If this is the last attempt, accept it and move on
                 if attempt == max_retries:
-                    accepted_bad_at_max_retries += 1  # NEW: Increment counter
+                    accepted_bad_at_max_retries += 1
                     good_dice_count += 1
                     all_good_messages.append(new_msg)
                     log(f"Max retries reached (attempt {attempt}), accepting bad roll {val} ({good_dice_count}/{TARGET_GOOD_DICE})")
@@ -147,7 +179,6 @@ async def send_replacement_until_good(client, chat_id):
             log(f"Replacement {val} → good ({good_dice_count}/{TARGET_GOOD_DICE})")
             return new_msg
         
-        # Fallback (shouldn't reach here, but just in case)
         if last_msg:
             good_dice_count += 1
             all_good_messages.append(last_msg)
@@ -157,7 +188,7 @@ async def send_replacement_until_good(client, chat_id):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log(f"Error: {e}")
+        log(f"Error in replacement: {e}", is_error=True)
         return None
 
 
@@ -182,7 +213,7 @@ async def perform_batch_deletion():
         else:
             log(f"No deletion needed. Exactly {TARGET_GOOD_DICE} good dice.")
     except Exception as e:
-        log(f"Deletion error: {e}")
+        log(f"Deletion error: {e}", is_error=True)
 
 
 def reset_session():
@@ -190,17 +221,19 @@ def reset_session():
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
     global active_replacement_tasks, all_good_messages, is_cleaning, accepted_bad_at_max_retries
     
+    # Cancel active tasks
     for task in list(active_replacement_tasks):
         if not task.done():
             task.cancel()
     
+    # Clear all collections to free memory
     good_dice_count = 0
     bad_roll_occurrences.clear()
     messages_to_delete.clear()
     last_bad_rolls.clear()
     all_good_messages.clear()
     active_replacement_tasks.clear()
-    accepted_bad_at_max_retries = 0  # NEW: Reset counter
+    accepted_bad_at_max_retries = 0
     is_cleaning = False
 
 
@@ -237,41 +270,65 @@ async def handle_dice(client, message):
     
     # Wait for all replacement tasks to complete before checking
     if active_replacement_tasks:
-        await asyncio.gather(*list(active_replacement_tasks), return_exceptions=True)
+        await asyncio.gather(*active_replacement_tasks, return_exceptions=True)
     
-    # Single check point after all dice processing
     await check_and_cleanup()
 
 
 async def start_monitoring():
-    """Start both Telegram clients and monitor dice"""
+    """Initialize and start both clients"""
     global user_client, bot_client, stop_event
     
     stop_event = asyncio.Event()
     
-    if SESSION_STRING:
-        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-    else:
-        user_client = Client("user_session", api_id=API_ID, api_hash=API_HASH)
-    
-    bot_client = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-    
-    @user_client.on_message(filters.dice)
-    async def dice_handler(client, message):
-        if message.chat.id == TARGET_CHAT_ID:
+    try:
+        user_client = Client(
+            "user_session",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING
+        )
+        
+        bot_client = Client(
+            "bot_session",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN
+        )
+        
+        @user_client.on_message(filters.dice)
+        async def user_dice_handler(client, message):
             await handle_dice(client, message)
-    
-    async with user_client, bot_client:
+        
+        log("Starting clients...")
+        await user_client.start()
+        await bot_client.start()
+        
+        # Get client information
         user_me = await user_client.get_me()
         bot_me = await bot_client.get_me()
+        
         log(f"User: {user_me.first_name} | Bot: @{bot_me.username}")
         log(f"Monitoring chat: {TARGET_CHAT_ID}")
         log(f"Bad rolls: {BAD_ROLLS} | Target: {TARGET_GOOD_DICE}\n")
+        
         await stop_event.wait()
+        
+    except Exception as e:
+        log(f"Client error: {e}", is_error=True)
+    finally:
+        log("Shutting down clients...")
+        try:
+            if user_client:
+                await user_client.stop()
+            if bot_client:
+                await bot_client.stop()
+        except:
+            pass
 
 
 def run_bot_in_thread():
-    """Run bot in separate thread with its own event loop"""
+    """Run the bot in a separate thread with its own event loop"""
     global bot_loop, is_running
     
     if sys.platform != 'win32':
@@ -289,9 +346,10 @@ def run_bot_in_thread():
     try:
         bot_loop.run_until_complete(start_monitoring())
     except Exception as e:
-        log(f"Error: {e}")
+        log(f"Bot thread error: {e}", is_error=True)
     finally:
         is_running = False
+        # Cleanup
         try:
             pending = asyncio.all_tasks(bot_loop)
             for task in pending:
@@ -306,53 +364,103 @@ def run_bot_in_thread():
                 pass
 
 
-def start_bot(chat_id, bad_rolls_input, target_dice):
+# Flask routes and authentication
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('authenticated'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/')
+def login():
+    """Login page"""
+    if session.get('authenticated'):
+        return redirect(url_for('index'))
+    return render_template('login.html')
+
+
+@app.route('/auth', methods=['POST'])
+def authenticate():
+    """Handle login"""
+    password = request.form.get('password', '')
+    if not ACCESS_PASSWORD or password == ACCESS_PASSWORD:
+        session['authenticated'] = True
+        return redirect(url_for('index'))
+    return render_template('login.html', error='Invalid password')
+
+
+@app.route('/logout')
+def logout():
+    """Logout"""
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route('/dashboard')
+@login_required
+def index():
+    """Main dashboard"""
+    return render_template('dashboard.html')
+
+
+@app.route('/start', methods=['POST'])
+@login_required
+def start_bot_route():
     """Start the bot with given configuration"""
-    global TARGET_CHAT_ID, BAD_ROLLS, TARGET_GOOD_DICE, is_running, bot_thread, accumulated_logs
+    global TARGET_CHAT_ID, BAD_ROLLS, TARGET_GOOD_DICE, is_running, bot_thread
     
     if is_running:
-        return "Bot already running!", ""
+        return jsonify({'status': 'error', 'message': 'Bot already running!'})
     
     try:
-        accumulated_logs.clear()
-        
-        TARGET_CHAT_ID = int(chat_id)
-        bad_rolls_list = [int(x.strip()) for x in bad_rolls_input.split(",")]
+        data = request.json
+        TARGET_CHAT_ID = int(data['chat_id'])
+        bad_rolls_list = [int(x.strip()) for x in data['bad_rolls'].split(",")]
         BAD_ROLLS = set(bad_rolls_list)
-        TARGET_GOOD_DICE = int(target_dice)
+        TARGET_GOOD_DICE = int(data['target_dice'])
         
         if not all(1 <= x <= 6 for x in BAD_ROLLS):
-            return "Bad rolls must be 1-6!", ""
+            return jsonify({'status': 'error', 'message': 'Bad rolls must be 1-6!'})
         
         if len(BAD_ROLLS) >= 6:
-            return "Must have at least one good roll!", ""
+            return jsonify({'status': 'error', 'message': 'Must have at least one good roll!'})
+        
+        # Clear logs before starting
+        with log_lock:
+            dice_logs.clear()
+            error_logs.clear()
         
         is_running = True
         bot_thread = Thread(target=run_bot_in_thread, daemon=True)
         bot_thread.start()
         
-        return "Bot started!", "Initializing..."
+        return jsonify({'status': 'success', 'message': 'Bot started!'})
         
     except ValueError as e:
         is_running = False
-        return f"Invalid input: {e}", ""
+        return jsonify({'status': 'error', 'message': f'Invalid input: {e}'})
     except Exception as e:
         is_running = False
-        return f"Error: {e}", ""
+        return jsonify({'status': 'error', 'message': f'Error: {e}'})
 
 
-def stop_bot():
+@app.route('/stop', methods=['POST'])
+@login_required
+def stop_bot_route():
     """Stop the bot gracefully"""
-    global is_running, stop_event, bot_loop, accumulated_logs
+    global is_running, stop_event, bot_loop
     
     if not is_running:
-        return "Bot not running!"
+        return jsonify({'status': 'error', 'message': 'Bot not running!'})
     
     log("Stopping...")
     is_running = False
     
     reset_session()
-    accumulated_logs.clear()
     
     if stop_event and bot_loop:
         try:
@@ -360,144 +468,54 @@ def stop_bot():
         except:
             pass
     
-    import time
     time.sleep(1)
     
+    # Clear all logs on stop
+    with log_lock:
+        error_logs.clear()
+        dice_logs.clear()
+    
     log("Bot stopped!")
-    return "Bot stopped!"
+    return jsonify({'status': 'success', 'message': 'Bot stopped!'})
 
 
+@app.route('/status')
+@login_required
+def get_status():
+    """Get current bot status"""
+    return jsonify({
+        'running': is_running,
+        'good_dice': good_dice_count,
+        'target': TARGET_GOOD_DICE
+    })
+
+
+@app.route('/stream')
+@login_required
+def stream():
+    """Server-Sent Events endpoint for live logs"""
+    def generate():
+        while True:
+            try:
+                # Get log from queue with timeout
+                message = log_queue.get(timeout=1)
+                yield f"data: {message}\n\n"
+            except queue.Empty:
+                # Send heartbeat to keep connection alive
+                yield f": heartbeat\n\n"
+            except GeneratorExit:
+                break
+    
+    return Response(generate(), mimetype='text/event-stream')
+
+
+@app.route('/get_logs')
+@login_required
 def get_logs():
-    """Retrieve logs from queue"""
-    global accumulated_logs
-    
-    new_logs = []
-    while not log_queue.empty():
-        try:
-            new_logs.append(log_queue.get_nowait())
-        except:
-            break
-    
-    if new_logs:
-        accumulated_logs.extend(new_logs)
-    
-    return "\n".join(accumulated_logs) if accumulated_logs else ""
-
-
-def verify_password(password):
-    """Verify the entered password"""
-    if not ACCESS_PASSWORD:
-        return True
-    return password == ACCESS_PASSWORD
-
-
-def create_main_interface():
-    """Create the main bot control interface"""
-    with gr.Column():
-        gr.Markdown("# Telegram Dice Controller")
-        gr.Markdown("**User Bot:** Sends dice | **Bot:** Deletes messages")
-        
-        with gr.Row():
-            with gr.Column():
-                chat_id_input = gr.Textbox(
-                    label="Target Chat ID",
-                    placeholder="enter group Id start from -100",
-                    value="-1003151338912"
-                )
-                bad_rolls_input = gr.Textbox(
-                    label="Bad Rolls (comma-separated)",
-                    placeholder="3,4",
-                    value="3,4"
-                )
-                target_dice_input = gr.Textbox(
-                    label="Target Good Dice Count",
-                    placeholder="6",
-                    value="6"
-                )
-                
-                with gr.Row():
-                    start_btn = gr.Button("Start Bot", variant="primary")
-                    stop_btn = gr.Button("Stop Bot", variant="stop")
-                
-                status_output = gr.Textbox(label="Status", interactive=False)
-            
-            with gr.Column():
-                gr.Markdown("### Live Logs")
-                log_output = gr.Textbox(
-                    label="Bot Logs",
-                    lines=20,
-                    max_lines=30,
-                    interactive=False,
-                    autoscroll=True
-                )
-        
-        start_btn.click(
-            fn=start_bot,
-            inputs=[chat_id_input, bad_rolls_input, target_dice_input],
-            outputs=[status_output, log_output]
-        )
-        
-        stop_btn.click(fn=stop_bot, outputs=[status_output])
-        
-        timer = gr.Timer(value=0.5, active=True)
-        timer.tick(fn=get_logs, outputs=[log_output])
-
-
-def create_login_interface():
-    """Create the password login interface"""
-    with gr.Column():
-        gr.Markdown("# 🔐 Access Required")
-        gr.Markdown("Please enter the password to access the Telegram Dice Controller")
-        
-        password_input = gr.Textbox(
-            label="Password",
-            type="password",
-            placeholder="Enter password"
-        )
-        login_btn = gr.Button("Login", variant="primary")
-        error_msg = gr.Markdown("", visible=False)
-        
-        return password_input, login_btn, error_msg
-
-
-# Gradio UI with authentication
-with gr.Blocks(title="Telegram Dice") as demo:
-    authenticated = gr.State(False)
-    
-    with gr.Group(visible=True) as login_group:
-        password_input, login_btn, error_msg = create_login_interface()
-    
-    with gr.Group(visible=False) as main_group:
-        create_main_interface()
-    
-    def login(password, auth_state):
-        """Handle login attempt"""
-        if verify_password(password):
-            return {
-                authenticated: True,
-                login_group: gr.update(visible=False),
-                main_group: gr.update(visible=True),
-                error_msg: gr.update(visible=False)
-            }
-        else:
-            return {
-                authenticated: False,
-                login_group: gr.update(visible=True),
-                main_group: gr.update(visible=False),
-                error_msg: gr.update("❌ Invalid password. Please try again.", visible=True)
-            }
-    
-    login_btn.click(
-        fn=login,
-        inputs=[password_input, authenticated],
-        outputs=[authenticated, login_group, main_group, error_msg]
-    )
-    
-    password_input.submit(
-        fn=login,
-        inputs=[password_input, authenticated],
-        outputs=[authenticated, login_group, main_group, error_msg]
-    )
+    """Get all current logs (for initial load)"""
+    with log_lock:
+        all_logs = error_logs + dice_logs
+    return jsonify({'logs': all_logs})
 
 
 if __name__ == "__main__":
@@ -515,4 +533,9 @@ if __name__ == "__main__":
         print("[Security] Password authentication enabled.")
     
     port = int(os.getenv("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    
+    # Create templates directory if it doesn't exist
+    os.makedirs('templates', exist_ok=True)
+    
+    print(f"[Server] Starting on port {port}...")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
