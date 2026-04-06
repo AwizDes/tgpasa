@@ -17,6 +17,16 @@ logging.getLogger("pyrogram").setLevel(logging.CRITICAL)
 logging.getLogger("pyrogram.client").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
 
+# Suppress /status endpoint from Flask request logs
+log_filter = logging.Filter()
+_original_log = logging.getLogger("werkzeug")
+
+class NoStatusFilter(logging.Filter):
+    def filter(self, record):
+        return "/status" not in record.getMessage()
+
+logging.getLogger("werkzeug").addFilter(NoStatusFilter())
+
 # Suppress "Task exception was never retrieved" errors
 def custom_exception_handler(loop, context):
     exception = context.get('exception')
@@ -68,7 +78,7 @@ log_lock = Lock()
 error_logs = []  # Keep error logs separate
 dice_logs = []   # Clear after each round
 MAX_ERROR_LOGS = 100
-MAX_DICE_LOGS = 50  # Reduced since they're cleared after rounds
+MAX_DICE_LOGS = 50
 
 # Config from UI
 TARGET_CHAT_ID = None
@@ -87,16 +97,13 @@ def log(message, is_error=False):
     with log_lock:
         if is_error or "Error" in message or "error" in message.lower():
             error_logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-            # Keep only last MAX_ERROR_LOGS
             if len(error_logs) > MAX_ERROR_LOGS:
                 error_logs.pop(0)
         else:
             dice_logs.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-            # Keep only last MAX_DICE_LOGS
             if len(dice_logs) > MAX_DICE_LOGS:
                 dice_logs.pop(0)
     
-    # Also put in queue for SSE
     log_queue.put(message)
 
 
@@ -128,7 +135,7 @@ async def check_and_cleanup():
         await perform_batch_deletion()
         await top_up_missing_dice()
         reset_session()
-        clear_dice_logs()  # Clear dice logs after successful round
+        clear_dice_logs()
         is_cleaning = False
         log("Ready for next round\n")
 
@@ -221,12 +228,10 @@ def reset_session():
     global good_dice_count, bad_roll_occurrences, messages_to_delete, last_bad_rolls
     global active_replacement_tasks, all_good_messages, is_cleaning, accepted_bad_at_max_retries
     
-    # Cancel active tasks
     for task in list(active_replacement_tasks):
         if not task.done():
             task.cancel()
     
-    # Clear all collections to free memory
     good_dice_count = 0
     bad_roll_occurrences.clear()
     messages_to_delete.clear()
@@ -268,7 +273,6 @@ async def handle_dice(client, message):
         all_good_messages.append(message)
         log(f"{sender} rolled {val} ({good_dice_count}/{TARGET_GOOD_DICE})")
     
-    # Wait for all replacement tasks to complete before checking
     if active_replacement_tasks:
         await asyncio.gather(*active_replacement_tasks, return_exceptions=True)
     
@@ -287,7 +291,6 @@ async def start_monitoring():
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=SESSION_STRING,
-            in_memory=True
         )
         
         bot_client = Client(
@@ -295,7 +298,6 @@ async def start_monitoring():
             api_id=API_ID,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
-            in_memory=True
         )
         
         @user_client.on_message(filters.dice)
@@ -306,7 +308,6 @@ async def start_monitoring():
         await user_client.start()
         await bot_client.start()
         
-        # Get client information
         user_me = await user_client.get_me()
         bot_me = await bot_client.get_me()
         
@@ -320,12 +321,16 @@ async def start_monitoring():
         log(f"Client error: {e}", is_error=True)
     finally:
         log("Shutting down clients...")
+        # Properly release session files to prevent SQLite lock on next start
         try:
-            if user_client:
-                await user_client.stop()
-            if bot_client:
-                await bot_client.stop()
-        except:
+            if user_client and user_client.is_connected:
+                await asyncio.wait_for(user_client.stop(), timeout=3)
+        except Exception:
+            pass
+        try:
+            if bot_client and bot_client.is_connected:
+                await asyncio.wait_for(bot_client.stop(), timeout=3)
+        except Exception:
             pass
 
 
@@ -343,26 +348,37 @@ def run_bot_in_thread():
         bot_loop = asyncio.new_event_loop()
     
     bot_loop.set_exception_handler(custom_exception_handler)
-    
     asyncio.set_event_loop(bot_loop)
+
     try:
         bot_loop.run_until_complete(start_monitoring())
     except Exception as e:
         log(f"Bot thread error: {e}", is_error=True)
     finally:
         is_running = False
-        # Cleanup
+        # Force-stop clients if they're still connected after unclean exit
+        try:
+            if user_client and user_client.is_connected:
+                bot_loop.run_until_complete(asyncio.wait_for(user_client.stop(), timeout=3))
+        except Exception:
+            pass
+        try:
+            if bot_client and bot_client.is_connected:
+                bot_loop.run_until_complete(asyncio.wait_for(bot_client.stop(), timeout=3))
+        except Exception:
+            pass
+        # Cleanup event loop
         try:
             pending = asyncio.all_tasks(bot_loop)
             for task in pending:
                 task.cancel()
             bot_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except:
+        except Exception:
             pass
         finally:
             try:
                 bot_loop.close()
-            except:
+            except Exception:
                 pass
 
 
@@ -379,7 +395,6 @@ def login_required(f):
 
 @app.route('/')
 def login():
-    """Login page"""
     if session.get('authenticated'):
         return redirect(url_for('index'))
     return render_template('login.html')
@@ -387,7 +402,6 @@ def login():
 
 @app.route('/auth', methods=['POST'])
 def authenticate():
-    """Handle login"""
     password = request.form.get('password', '')
     if not ACCESS_PASSWORD or password == ACCESS_PASSWORD:
         session['authenticated'] = True
@@ -397,7 +411,6 @@ def authenticate():
 
 @app.route('/logout')
 def logout():
-    """Logout"""
     session.clear()
     return redirect(url_for('login'))
 
@@ -405,18 +418,22 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def index():
-    """Main dashboard"""
     return render_template('dashboard.html')
 
 
 @app.route('/start', methods=['POST'])
 @login_required
 def start_bot_route():
-    """Start the bot with given configuration"""
     global TARGET_CHAT_ID, BAD_ROLLS, TARGET_GOOD_DICE, is_running, bot_thread
     
     if is_running:
         return jsonify({'status': 'error', 'message': 'Bot already running!'})
+    
+    # Wait for previous thread to fully release session files before starting
+    if bot_thread and bot_thread.is_alive():
+        bot_thread.join(timeout=5)
+        if bot_thread.is_alive():
+            return jsonify({'status': 'error', 'message': 'Previous session still shutting down, please wait a moment.'})
     
     try:
         data = request.json
@@ -431,14 +448,10 @@ def start_bot_route():
         if len(BAD_ROLLS) >= 6:
             return jsonify({'status': 'error', 'message': 'Must have at least one good roll!'})
         
-        # Clear logs before starting
         with log_lock:
             dice_logs.clear()
             error_logs.clear()
         
-        if bot_thread and bot_thread.is_alive():
-            bot_thread.join(timeout=5)
-
         is_running = True
         bot_thread = Thread(target=run_bot_in_thread, daemon=True)
         bot_thread.start()
@@ -456,7 +469,6 @@ def start_bot_route():
 @app.route('/stop', methods=['POST'])
 @login_required
 def stop_bot_route():
-    """Stop the bot gracefully"""
     global is_running, stop_event, bot_loop
     
     if not is_running:
@@ -470,12 +482,11 @@ def stop_bot_route():
     if stop_event and bot_loop:
         try:
             bot_loop.call_soon_threadsafe(stop_event.set)
-        except:
+        except Exception:
             pass
     
     time.sleep(1)
     
-    # Clear all logs on stop
     with log_lock:
         error_logs.clear()
         dice_logs.clear()
@@ -487,7 +498,6 @@ def stop_bot_route():
 @app.route('/status')
 @login_required
 def get_status():
-    """Get current bot status"""
     return jsonify({
         'running': is_running,
         'good_dice': good_dice_count,
@@ -498,15 +508,12 @@ def get_status():
 @app.route('/stream')
 @login_required
 def stream():
-    """Server-Sent Events endpoint for live logs"""
     def generate():
         while True:
             try:
-                # Get log from queue with timeout
                 message = log_queue.get(timeout=1)
                 yield f"data: {message}\n\n"
             except queue.Empty:
-                # Send heartbeat to keep connection alive
                 yield f": heartbeat\n\n"
             except GeneratorExit:
                 break
@@ -517,7 +524,6 @@ def stream():
 @app.route('/get_logs')
 @login_required
 def get_logs():
-    """Get all current logs (for initial load)"""
     with log_lock:
         all_logs = error_logs + dice_logs
     return jsonify({'logs': all_logs})
@@ -539,7 +545,6 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 7860))
     
-    # Create templates directory if it doesn't exist
     os.makedirs('templates', exist_ok=True)
     
     print(f"[Server] Starting on port {port}...")
