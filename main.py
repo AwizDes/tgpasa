@@ -286,14 +286,16 @@ async def start_monitoring():
             "user_session",
             api_id=API_ID,
             api_hash=API_HASH,
-            session_string=SESSION_STRING
+            session_string=SESSION_STRING,
+            in_memory=True
         )
         
         bot_client = Client(
             "bot_session",
             api_id=API_ID,
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN
+            bot_token=BOT_TOKEN,
+            in_memory=True
         )
         
         @user_client.on_message(filters.dice)
@@ -434,6 +436,9 @@ def start_bot_route():
             dice_logs.clear()
             error_logs.clear()
         
+        if bot_thread and bot_thread.is_alive():
+            bot_thread.join(timeout=5)
+
         is_running = True
         bot_thread = Thread(target=run_bot_in_thread, daemon=True)
         bot_thread.start()
